@@ -1,3 +1,208 @@
+# Web Proxy Lab
+
+CS:APP Web Proxy Lab — HTTP 프록시 서버를 밑바닥부터 구현하며 네트워크 프로그래밍, 동시성, 캐싱을 학습합니다.
+
+---
+
+## 📚 학습 목표
+
+### 네트워크 기초
+- [x] 네트워크 개념 & TCP/IP 계층 이해
+- [x] 클라이언트-서버 모델 이해
+- [x] Datagram Socket vs Stream Socket 차이 설명
+- [x] 파일 디스크립터(fd) 개념 체화
+
+### 소켓 인터페이스
+- [x] `socket()` — 소켓 생성, fd 반환
+- [x] `bind()` — 주소(IP+포트) 부여 (서버 전용)
+- [x] `listen()` — 연결 대기 모드 전환 (서버 전용)
+- [x] `accept()` — 연결 수락, 새 fd 반환 (서버 전용)
+- [x] `connect()` — 서버 접속 (클라이언트 전용)
+- [x] `close()` — 소켓 종료, 자원 회수
+
+### 웹서버 & HTTP
+- [x] HTTP 요청/응답 메시지 구조 이해 (시작 라인 + 헤더 + 빈 줄 + 바디)
+- [x] HTTP 메서드 (GET, HEAD, POST) 구분
+- [x] HTTP 상태 코드 (2xx/4xx/5xx) 의미
+- [ ] MIME 타입 개념
+- [ ] 정적 컨텐츠 vs 동적 컨텐츠
+- [ ] CGI 동작 원리 (fork + dup2 + execve)
+
+### 프록시 서버
+- [x] Forward Proxy vs Reverse Proxy 차이
+- [ ] 프록시가 "서버이자 클라이언트"인 이유
+- [ ] 요청 헤더 재작성 (Host, User-Agent, Connection, Proxy-Connection)
+- [ ] HTTP/1.1 → HTTP/1.0 변환 의미
+
+---
+
+## 🎯 실습 체크리스트
+
+### Part 0: 환경 세팅
+
+- [x] Docker 또는 Ubuntu 22.04 환경 준비
+- [x] `webproxy-lab` 레포 clone
+- [x] 학습용 디렉토리 생성 (`netp/`)
+- [x] csapp.c, csapp.h 학습용 디렉토리로 복사
+- [x] VSCode IntelliSense 설정 (`_GNU_SOURCE` 매크로 추가)
+- [x] 포트 할당 도구 동작 확인 (`./port-for-user.pl`, `./free-port.sh`)
+
+### Part 1: Echo Server/Client (소켓 기초)
+
+- [x] CSAPP 11.1 ~ 11.4 읽기
+- [x] `echoclient.c` 책 따라 작성 (CSAPP Fig 11.20)
+- [x] `echoserveri.c` 책 따라 작성 (CSAPP Fig 11.21)
+- [x] `echo.c` 책 따라 작성 (CSAPP Fig 11.22)
+- [x] Makefile 작성 (타겟, 의존성, 컴파일 플래그 이해)
+- [x] 빌드 성공 (`make clean && make`)
+- [x] 두 터미널로 에코 통신 동작 확인
+- [ ] (선택) `hostinfo.c` 작성해서 getaddrinfo 체화
+
+### Part 2: Tiny Web Server
+
+- [x] CSAPP 11.5 (웹 서버) 읽기
+- [ ] `tiny.c` 함수 하나씩 구현 (책 Figure 11.29 ~ 11.35)
+  - [ ] `clienterror` — 에러 응답
+  - [ ] `read_requesthdrs` — 헤더 읽기
+  - [ ] `parse_uri` — URI 파싱
+  - [ ] `get_filetype` — MIME 타입 매핑
+  - [ ] `serve_static` — 정적 컨텐츠
+  - [ ] `serve_dynamic` — CGI 실행
+  - [ ] `doit` — 요청 처리 본체
+- [ ] `./tiny <port>` 빌드 및 실행
+- [ ] 브라우저로 `home.html` 접근 성공
+- [ ] 이미지 파일 (`godzilla.gif/jpg`) 렌더링 확인
+- [ ] CGI 동작 확인 (`/cgi-bin/adder?15213&18213`)
+- [ ] curl로 요청/응답 바이트 관찰 (`curl -v`)
+- [ ] netcat으로 수동 HTTP 요청 보내기
+- [ ] 에러 케이스 테스트 (존재하지 않는 파일, 미지원 메서드)
+
+### Part 3: CSAPP Homework (숙제 3문제 이상)
+
+- [ ] **11.6c** — MPG 비디오 타입 지원 추가
+- [ ] **11.7** — HEAD 메서드 지원 추가
+- [ ] **11.9** — `mmap` 대신 `malloc + rio_readn` 사용
+- [ ] (선택) **11.10** — POST 메서드 지원
+- [ ] (선택) **11.11** — Path Traversal 방어
+
+### Part 4: Proxy — Sequential (순차 처리)
+
+- [ ] Proxylab PDF 정독
+- [ ] `proxy.c` 구조 설계 (어떤 함수로 나눌지)
+- [ ] 리스닝 소켓 열기 (`Open_listenfd`)
+- [ ] accept 루프 구현
+- [ ] 클라이언트 요청 라인 파싱
+- [ ] URI에서 host/port/path 분리
+- [ ] 요청 헤더 읽기 및 재작성
+  - [ ] Host 헤더 처리
+  - [ ] User-Agent 고정 문자열로 치환
+  - [ ] Connection: close 설정
+  - [ ] Proxy-Connection: close 설정
+  - [ ] 나머지 헤더는 그대로 전달
+- [ ] HTTP/1.1 → HTTP/1.0 변환
+- [ ] 타겟 서버 접속 (`Open_clientfd`)
+- [ ] 요청 전달
+- [ ] 응답 수신 및 클라이언트로 전달 (바이너리 데이터 주의)
+- [ ] curl로 테스트 (`curl -v --proxy http://localhost:PORT http://...`)
+- [ ] 브라우저 프록시 설정으로 실사이트 테스트
+- [ ] `./driver.sh` Basic 테스트 통과
+
+### Part 5: Proxy — Concurrency (동시성)
+
+- [ ] CSAPP 12장 (동시 프로그래밍) 읽기
+- [ ] `pthread_create` + `pthread_detach` 패턴 이해
+- [ ] `connfd`를 힙에 복사하여 스레드에 전달 (race condition 방지)
+- [ ] 멀티스레드 요청 처리 구현
+- [ ] SIGPIPE 무시 처리 (`Signal(SIGPIPE, SIG_IGN)`)
+- [ ] EPIPE, ECONNRESET 에러 graceful 처리
+- [ ] 메모리 누수 없음 (valgrind 확인 권장)
+- [ ] fd 누수 없음 (모든 경로에서 close)
+- [ ] `./driver.sh` Concurrency 테스트 통과
+
+### Part 6: Proxy — Cache (캐시)
+
+- [ ] CSAPP 12.5 (스레드 동기화) 읽기
+- [ ] 캐시 자료구조 설계 (연결 리스트 권장)
+- [ ] MAX_CACHE_SIZE (1MiB), MAX_OBJECT_SIZE (100KiB) 상수 준수
+- [ ] 캐시 key 정의 (URI 기반)
+- [ ] `cache_get` — 캐시 조회
+- [ ] `cache_put` — 캐시 저장
+- [ ] LRU (혹은 근사 LRU) eviction 정책
+- [ ] 응답 전달 중 캐시 버퍼에 누적
+- [ ] MAX_OBJECT_SIZE 초과 시 캐시 포기 (전달은 계속)
+- [ ] Readers-Writers 동기화 구현
+  - [ ] `pthread_rwlock` 사용 또는 세마포어 직접 구현
+  - [ ] 다중 reader 동시 접근 허용
+  - [ ] writer는 단독 접근
+- [ ] (선택) 모듈 분리 (`cache.c`, `cache.h`)
+- [ ] `./driver.sh` Cache 테스트 통과
+
+### Part 7: Robustness & Final
+
+- [ ] 서버가 어떤 에러에도 종료되지 않음
+- [ ] malformed 요청 처리
+- [ ] 바이너리 데이터 전송 검증 (이미지, 비디오)
+- [ ] `./driver.sh` 전체 70/70 점수
+- [ ] WIL (Weekly I Learned) 작성
+
+---
+
+## 🛠 도구 & 레퍼런스
+
+### 자주 쓰는 명령
+
+```bash
+# 빌드
+make clean && make
+
+# 테스트
+./tiny <port>
+./proxy <port>
+curl -v --proxy http://localhost:<proxy_port> http://localhost:<tiny_port>/home.html
+./driver.sh
+
+# 디버깅
+netstat -tn | grep <port>    # 소켓 상태 확인
+lsof -i :<port>              # 포트 사용 프로세스 확인
+valgrind ./proxy <port>      # 메모리 누수 체크
+```
+
+### 참고 자료
+
+- **CSAPP 3판** 11장 (네트워크 프로그래밍), 12장 (동시 프로그래밍)
+- **RFC 1945** — HTTP/1.0 명세
+- **Proxylab PDF** — CMU 과제 명세
+- **CSAPP 저자 코드**: [csapp.cs.cmu.edu/3e/code.html](https://csapp.cs.cmu.edu/3e/code.html)
+
+---
+
+## 🚨 흔한 함정
+
+- [ ] `strlen`, `strcpy` 대신 RIO (`rio_readn`, `rio_writen`) 사용 — 바이너리 데이터 때문
+- [ ] `strtok` 재진입성 없음 — 스레드에서 `strtok_r` 사용
+- [ ] 전역 변수에 쓰기 — race condition 주의
+- [ ] `accept` 후 `connfd` 주소 직접 전달 → 힙 복사 필수
+- [ ] `close` 빠뜨림 → fd 누수 → "Too many open files"
+- [ ] HTTP/1.1 keep-alive 구현 시도 → 복잡도 폭발, 포기하고 `Connection: close`
+- [ ] TIME_WAIT로 인한 재시작 실패 → `SO_REUSEADDR` (csapp에 이미 있음)
+
+---
+
+## 📝 기술 정리 (WIL용)
+
+- [ ] 파일 디스크립터란 무엇인가
+- [ ] 소켓 API 6개의 역할과 서버/클라이언트 비대칭성
+- [ ] TCP 3-way handshake와 소켓 API의 매핑
+- [ ] Short count와 RIO 패키지의 존재 이유
+- [ ] HTTP 프로토콜의 바이트 레벨 구조
+- [ ] CGI의 `dup2` 트릭 — stdout을 소켓으로 리다이렉트
+- [ ] Forward Proxy와 Reverse Proxy의 차이 — 누가 프록시의 존재를 아는가
+- [ ] Readers-Writers 문제와 해결 전략
+- [ ] iterative vs concurrent 서버의 성능 특성
+- [ ] 프록시가 HTTP 요청 헤더를 수정하는 이유
+
+---
+
 # 📘 Docker + VSCode DevContainer 기반 C 개발 환경 구축 가이드 (WebProxyLab)
 
 이 문서는 **Windows**와 **macOS** 사용자가 Docker와 VSCode DevContainer 기능을 활용하여 C 개발 및 디버깅 환경을 빠르게 구축할 수 있도록 도와줍니다.
