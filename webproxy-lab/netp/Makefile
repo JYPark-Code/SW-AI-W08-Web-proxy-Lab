@@ -28,7 +28,7 @@ LIB = -lpthread
 #
 # 의미: "타겟 파일을 만들려면 이 의존파일들이 필요하고, 이 명령으로 만든다"
 
-all: echoclient echoserveri
+all: echoclient echoserveri hostinfo
 # 'all'은 관례적 기본 타겟. 'make'만 치면 첫 번째 타겟이 실행되는데, 관례상 all을 최상단에 둠.
 # all 자체는 파일이 아닌 "가상 타겟" (phony target). 실제 파일 안 만듦.
 # 단지 "echoclient와 echoserveri를 빌드하라"는 의미.
@@ -46,11 +46,14 @@ echoclient: echoclient.c csapp.o
 #   echoclient.c csapp.o : 이 둘을 컴파일+링크해서 실행 파일 생성
 
 
+hostinfo: hostinfo.c csapp.o
+	$(CC) $(CFLAGS) -o hostinfo hostinfo.c csapp.o $(LIB)
+
+
 echoserveri: echoserveri.c csapp.o echo.o
 	$(CC) $(CFLAGS) -o echoserveri echoserveri.c csapp.o echo.o $(LIB)
 # 서버는 echo 함수를 호출하므로 echo.o도 링크 필요.
 # echoclient와 구조 같지만 echo.o가 추가됨.
-
 
 echo.o: echo.c 
 	$(CC) $(CFLAGS) -c echo.c
@@ -72,7 +75,7 @@ csapp.o: csapp.c
 
 # ===== 청소 규칙 =====
 clean:
-	rm -f *.o echoclient echoserveri *~
+	rm -f *.o echoclient echoserveri hostinfo *~
 # 'make clean' 실행 시 호출. 빌드 산출물 제거.
 #   *.o         : 모든 오브젝트 파일 (csapp.o, echo.o)
 #   echoclient  : 실행 파일
