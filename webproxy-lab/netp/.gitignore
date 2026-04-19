@@ -1,6 +1,7 @@
 # Targets
 echoclient
 echoserveri
+hostinfo
 
 # MacOS
 .DS_Store
