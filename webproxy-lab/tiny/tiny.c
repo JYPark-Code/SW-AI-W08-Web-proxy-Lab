@@ -369,6 +369,10 @@ void get_filetype(char *filename, char *filetype)
     strcpy(filetype, "image/png");
   else if (strstr(filename, ".jpg"))
     strcpy(filetype, "image/jpeg");
+  else if (strstr(filename, ".mpg"))           
+    strcpy(filetype, "video/mpeg");
+  else if (strstr(filename, ".mp4"))        
+    strcpy(filetype, "video/mp4");                
   else
     strcpy(filetype, "text/plain");  /* 알 수 없으면 일반 텍스트로 */
 }
