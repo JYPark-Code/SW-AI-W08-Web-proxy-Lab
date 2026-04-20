@@ -349,15 +349,190 @@ basic 테스트 로직을 읽어본 게 구현 방향에 도움이 됐다:
 
 ### Part 5: Proxy — Concurrency (동시성)
 
-- [ ] CSAPP 12장 (동시 프로그래밍) 읽기
-- [ ] `pthread_create` + `pthread_detach` 패턴 이해
-- [ ] `connfd`를 힙에 복사하여 스레드에 전달 (race condition 방지)
-- [ ] 멀티스레드 요청 처리 구현
-- [ ] SIGPIPE 무시 처리 (`Signal(SIGPIPE, SIG_IGN)`)
-- [ ] EPIPE, ECONNRESET 에러 graceful 처리
-- [ ] 메모리 누수 없음 (valgrind 확인 권장)
-- [ ] fd 누수 없음 (모든 경로에서 close)
-- [ ] `./driver.sh` Concurrency 테스트 통과
+- [x] CSAPP 12장 (동시 프로그래밍) 읽기
+- [x] `pthread_create` + `pthread_detach` 패턴 이해
+- [x] `connfd`를 힙에 복사하여 스레드에 전달 (race condition 방지)
+- [x] 멀티스레드 요청 처리 구현
+- [x] SIGPIPE 무시 처리 (`Signal(SIGPIPE, SIG_IGN)`)
+- [x] EPIPE, ECONNRESET 에러 graceful 처리
+- [x] 메모리 누수 없음 (valgrind 확인 권장)
+- [x] fd 누수 없음 (모든 경로에서 close)
+- [x] `./driver.sh` Concurrency 테스트 통과
+
+#### Part 5 — 구현 플로우 & 배운 점
+
+**왜 동시성이 필요한가 — iterative 서버의 한계**
+
+Part 1의 sequential proxy는 accept 루프에서 `doit()`이 끝나야 다음 요청을 받는 구조다. 이 상태에서 백엔드가 느리거나 무응답이면 **다른 모든 요청이 대기**한다. driver.sh의 concurrency 테스트가 이 시나리오를 정확히 찌른다 — 응답하지 않는 `nop-server.py`에 요청을 보낸 상태에서 동시에 Tiny로 요청을 보내, 두 번째 요청이 첫 번째에 막히지 않고 처리되는지 확인한다.
+
+해결책은 각 요청을 별도 실행 흐름으로 분리하는 것. 세 선택지가 있다:
+
+| 방식 | 장점 | 단점 |
+|---|---|---|
+| 멀티프로세싱 (fork) | 격리, 안전 | 생성 비용 높음, 캐시 공유 어려움 (IPC 필요) |
+| 멀티스레딩 (pthread) | 생성 비용 낮음, 메모리 공유 쉬움 | race condition 위험 |
+| 이벤트 루프 (select/epoll) | 가장 가벼움 | 구현 복잡도 높음 |
+
+Proxylab은 멀티스레딩을 선택한다. 이유는 Part 3 캐시가 **모든 스레드가 공유하는 전역 자원**이어야 하기 때문. fork로 가면 프로세스 간 공유 메모리 API를 따로 써야 하는데 과제 범위를 넘어간다. thread는 전역 변수를 그대로 공유할 수 있고, 대신 동기화 책임이 생긴다. 이 트레이드오프를 받아들이는 게 이번 파트의 핵심.
+
+---
+
+**pthread_create + pthread_detach 패턴 — "만들고 놓아주기"**
+
+스레드도 fork의 좀비 문제와 같은 구조를 가진다. 스레드가 종료되면 커널이 "이 스레드는 이렇게 끝났다"는 정보를 보관하고, 누군가 회수해 가기 전까지 유지된다. 회수 방법은 둘:
+
+- `pthread_join(tid, ...)` — 메인이 스레드 종료를 **기다렸다가** 회수 (fork의 `wait`와 대응)
+- `pthread_detach(tid)` — "내 정리는 OS에 맡긴다" 선언, 기다릴 필요 없음
+
+Proxy의 accept 루프에 `pthread_join`을 쓰면 메인이 스레드 끝날 때까지 대기하느라 **다음 accept를 못 한다**. 동시성이 깨진다. 그래서 **detach가 필수**.
+
+detach를 호출하는 위치는 두 가지 선택 가능하다:
+- 메인에서 `pthread_create` 직후 `pthread_detach(tid)` 호출
+- 스레드 자신이 시작하자마자 `pthread_detach(pthread_self())` 호출
+
+CSAPP은 후자를 쓰는데, 스레드의 생명주기 관리를 스레드 함수 하나에 캡슐화해서 main이 실수로 detach를 빼먹지 않게 하는 설계 의도다. `pthread_self()`는 자기 자신의 스레드 ID를 반환하는 관용구 — Java의 `Thread.currentThread()`와 비슷한 역할.
+
+```c
+
+문법적으론 문제 없다. 하지만 런타임에 치명적이다:
+시각  메인                        스레드 1          스레드 2
+────  ──────────────────         ────────────     ────────────
+t=0   connfd = 4 (A 요청)
+t=1   pthread_create(..., &connfd)
+t=2                                시작됨, 아직 *vargp 안 읽음
+t=3   (다음 루프)
+t=4   connfd = 5 (B 요청)  ← 덮어쓰기!
+t=5   pthread_create(..., &connfd)
+t=6                                *vargp 읽음 → 5 !!
+(4를 처리해야 했음)
+t=7                                                   *vargp 읽음 → 5
+결과: A 요청(fd 4)는 아무도 처리 안 함, B 요청(fd 5)는 두 스레드가 동시 처리
+
+두 가지 재앙이 동시에 터진다:
+
+1. **요청 누락**: fd 4는 Accept됐지만 어느 스레드도 처리하지 않음 → 클라이언트 무한 대기
+2. **데이터 경합**: 두 스레드가 같은 fd(5)에 동시 read/write → 버퍼 내용 섞이고 응답 바이트 interleaving
+
+이게 **race condition**이다. "race" = 경주, 누가 먼저 도달하느냐에 따라 결과가 달라진다. 재현이 어려운 게 특징이다:
+- 요청 1개만 보낼 땐 안 터짐 (덮어쓸 기회가 없음)
+- 디버거로 단계 실행하면 타이밍이 달라져서 안 터짐 — **하이젠버그**
+- 부하 상황에서 간헐적으로만 터짐
+
+눈에 안 보이는데 재현도 안 되는 버그가 제일 위험하다. 그래서 **구조적으로 막는 게** 맞다. 힙 복사로.
+
+```c
+int *connfdp = Malloc(sizeof(int));         /* 매번 새 주소 */
+*connfdp = Accept(listenfd, ...);            /* 값 저장 */
+pthread_create(&tid, NULL, thread, connfdp); /* 힙 주소 전달 */
+```
+
+`Malloc`은 매번 다른 힙 주소를 반환한다. 스레드 1의 주소와 스레드 2의 주소가 겹칠 일이 없다. 그리고 스레드는 받자마자 스택에 로컬 복사:
+
+```c
+int connfd = *((int *)vargp);    /* 스택에 복사 */
+Free(vargp);                      /* 이제 힙 해제해도 됨 */
+```
+
+이후 `connfd`는 이 스레드의 스택에만 존재. 다른 스레드가 절대 볼 수 없는 완전 격리 영역. **"공유하지 않는다"**가 가장 확실한 race 방지책이다.
+
+이 경험에서 얻은 일반 원칙: **공유하지 말거나, 공유하면 동기화하라**. Proxy의 fd는 "공유 안 하기"(힙 따로 할당)를 선택했고, Part 3의 캐시는 어쩔 수 없이 공유해야 하니 "동기화"(rwlock)를 선택할 예정. 같은 문제에 두 가지 해결 방식을 한 과제에서 다 써본다.
+
+---
+
+**SIGPIPE 무시 — 조용한 킬러**
+
+Proxy가 클라이언트에 응답 쓰는 중 클라이언트가 갑자기 연결을 끊으면(curl Ctrl+C, 브라우저 탭 닫기, 타임아웃 등), OS가 `SIGPIPE` 시그널을 발생시킨다. **기본 동작은 프로세스 즉시 종료**. 한 요청의 사소한 문제로 **Proxy 전체가 죽고, 그 안의 모든 스레드가 함께 사라진다**. 동시성 서버에서 가장 치명적인 failure 모드.
+
+해결은 한 줄:
+```c
+Signal(SIGPIPE, SIG_IGN);
+```
+
+main 시작 부분에 한 번만. 이후엔:
+- SIGPIPE 발생해도 프로세스는 살아있음
+- `Rio_writen`이 에러 반환 (errno = EPIPE)
+- 해당 스레드는 에러 나도 function return → detach 덕분에 자원 정리
+- 다른 스레드와 메인은 영향 없음
+
+`Signal()`은 csapp이 제공하는 래퍼인데, POSIX `sigaction`을 내부적으로 써서 이식성 있게 시그널 핸들러를 설정한다. 이걸 그냥 `signal()`로 쓰면 시스템마다 재설정 필요 여부가 달라서 버그 날 수 있다는 게 CSAPP 8장 내용.
+
+---
+
+**accept 루프의 최종 구조**
+
+변경 전 (Sequential):
+```c
+while (1) {
+    clientfd = Accept(listenfd, ...);
+    doit(clientfd);
+    Close(clientfd);
+}
+```
+
+변경 후 (Concurrent):
+```c
+while (1) {
+    int *connfdp = Malloc(sizeof(int));
+    *connfdp = Accept(listenfd, ...);
+    Pthread_create(&tid, NULL, thread, connfdp);
+}
+```
+
+코드 분량은 거의 같은데 의미 변화가 크다:
+- 메인은 **accept만 전담**. doit 안 함. 받자마자 다음 받기.
+- 스레드는 **각자 독립**. 힙 주소 받아 로컬 복사 후 자기 일.
+- 메인과 스레드의 유일한 통신 채널은 **힙에 저장된 connfd 값**. 주고받고 나면 끝.
+
+한 번 만들어두면 "동시 요청" 상황이 저절로 해결되는 구조. 특별한 스케줄링 로직 없이 OS가 알아서 스레드 분배해준다.
+
+---
+
+**테스트 — 동시성이 실제로 동작하는지 눈으로 확인**
+
+driver.sh 자동 채점 외에, 동시성이 진짜로 일어나는지 육안 확인도 했다. 터미널 3개:
+
+```bash
+# Tiny 백엔드
+cd tiny && ./tiny 15213
+
+# Proxy
+./proxy 15214
+
+# 동시에 두 요청 (백그라운드)
+curl --proxy http://localhost:15214 http://localhost:15213/home.html &
+curl --proxy http://localhost:15214 http://localhost:15213/home.html &
+```
+
+Proxy 터미널에 `Accepted connection from ...` 로그가 **두 줄 연속으로** 찍히면 동시 접속 받은 것. Sequential이면 첫 번째 요청 처리 끝나야 두 번째 "Accepted" 떴을 테고, Concurrent면 거의 동시에 뜬다. 이 차이를 직접 보면 동시성이 추상적 개념에서 관찰 가능한 현상이 된다.
+
+driver.sh 점수:
+
+basicScore: 40/40
+concurrencyScore: 15/15
+cacheScore: 0/15   ← Part 6에서
+totalScore: 55/70
+
+---
+
+**정리된 질문 — 내가 답할 수 있어야 하는 것들**
+
+면접/발표 대비로 정리:
+
+1. **Proxy가 왜 thread를 쓰는가, process(fork)가 아닌가?**
+   - 생성 비용 낮음. Part 3 캐시 공유 위해 같은 메모리 공간 필요.
+
+2. **왜 connfd를 힙에 복사하는가?**
+   - 메인 루프의 지역 변수는 다음 루프에서 덮어써져서 스레드가 잘못된 값 읽음 (race condition). 매번 다른 힙 주소를 쓰면 스레드끼리 간섭 없음.
+
+3. **왜 pthread_detach인가, pthread_join은 안 되나?**
+   - join은 메인이 기다림 → 다음 accept 못 함 → 동시성 파괴.
+   - detach는 OS가 자동 정리 → 메인은 받자마자 다음 요청으로.
+
+4. **왜 SIGPIPE 무시인가?**
+   - 클라이언트가 갑자기 끊으면 SIGPIPE로 프로세스 죽음. 동시성 서버에서 한 요청 때문에 전체가 죽는 건 치명적. 무시하면 write가 에러 반환만 하고 해당 스레드만 에러 처리.
+
+5. **race condition의 일반적 해결 전략은?**
+   - "공유하지 말거나, 공유하면 동기화." Proxy는 fd를 "공유 안 하기"(힙 독립 할당), 캐시는 "공유하면서 동기화"(rwlock).
 
 ### Part 6: Proxy — Cache (캐시)
 
