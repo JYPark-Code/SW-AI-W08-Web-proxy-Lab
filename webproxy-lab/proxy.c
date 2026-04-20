@@ -1,16 +1,46 @@
 /*
- * proxy.c - A simple HTTP proxy server (Part 1: Sequential)
+ * proxy.c - A simple concurrent HTTP proxy server with caching
  *
  * 흐름:
- *   1. 포트에서 리스닝
- *   2. 브라우저 접속 받음
- *   3. 브라우저의 HTTP 요청을 파싱
- *   4. URL에서 host/port/path 추출
- *   5. 요청 헤더 재작성
- *   6. 실제 서버(Tiny 등)에 접속
+ *   [메인 스레드]
+ *   1. 명령줄 포트 인자 검증
+ *   2. SIGPIPE 무시 설정 (클라이언트 끊어져도 Proxy 생존)
+ *   3. 캐시 초기화 (전역 cache_t, rwlock 포함)
+ *   4. 리스닝 소켓 열기 (Open_listenfd)
+ *   5. accept 루프:
+ *      a. 힙에 connfd 저장 (race condition 방지)
+ *      b. 새 스레드 생성 (Pthread_create)
+ *      c. 메인은 바로 다음 accept (동시성 유지)
+ *
+ *   [워커 스레드]
+ *   1. 전달받은 힙에서 connfd 로컬 복사
+ *   2. Pthread_detach(Pthread_self())로 자원 자동 회수 예약
+ *   3. Free(vargp)로 힙 해제
+ *   4. doit(connfd)로 요청 처리
+ *   5. Close(connfd)
+ *
+ *   [doit: 요청 처리 본체]
+ *   1. 브라우저 요청 라인 읽기 (GET http://... HTTP/1.1)
+ *   2. GET 메서드 검증
+ *   3. parse_uri로 URL을 hostname/port/path 분해
+ *   4. cache_find로 캐시 조회:
+ *      - HIT: 캐시 데이터를 클라이언트로 전송하고 종료
+ *      - MISS: 아래 5~9단계 진행
+ *   5. build_requesthdrs로 HTTP/1.0 요청 재작성
+ *      (Host 유지, User-Agent/Connection/Proxy-Connection 덮어쓰기)
+ *   6. Open_clientfd로 백엔드 서버 접속
  *   7. 재작성된 요청 전송
- *   8. 응답 받아서 브라우저로 그대로 전달
- *   9. 연결 종료, 다음 요청 대기
+ *   8. 응답 수신하며 클라이언트로 포워드
+ *      (MAX_OBJECT_SIZE 이하면 동시에 로컬 버퍼에 누적)
+ *   9. 누적 성공 시 cache_insert로 저장
+ *  10. 백엔드 연결 종료
+ *
+ *   [캐시 — 전역 자원, Readers-Writers 동기화]
+ *   - 이중 연결 리스트 기반 LRU (head=최근, tail=오래됨)
+ *   - cache_find: rdlock (다중 reader 동시 허용)
+ *   - cache_insert, cache_evict: wrlock (writer 단독)
+ *   - MAX_CACHE_SIZE 초과 시 tail부터 evict
+ *   - MAX_OBJECT_SIZE 초과 객체는 캐시 스킵 (포워딩만)
  */
 #include <stdio.h>
 #include "csapp.h"
@@ -24,12 +54,38 @@ static const char *user_agent_hdr =
     "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 "
     "Firefox/10.0.3\r\n";
 
-/* 함수 프로토타입 */
+/* 캐시 엔트리: 이중 연결 리스트의 노드 */
+typedef struct cache_entry {
+    char uri[MAXLINE];              /* 캐시 키 (전체 URL) */
+    char *data;                      /* 응답 데이터 (동적 할당) */
+    int size;                        /* 데이터 크기 */
+    struct cache_entry *prev;
+    struct cache_entry *next;
+} cache_entry_t;
+
+/* 캐시 전체 */
+typedef struct {
+    cache_entry_t *head;             /* 가장 최근 사용 */
+    cache_entry_t *tail;             /* 가장 오래 미사용 */
+    int total_size;                  /* 현재 사용 중인 바이트 합 */
+    pthread_rwlock_t lock;           /* Readers-Writers 락 */
+} cache_t;
+
+/* 전역 캐시 */
+cache_t cache;
+
+/* ------------------------------ 함수 프로토타입 ------------------------------ */
 void doit(int clientfd);
 int parse_uri(char *uri, char *hostname, char *port, char *path);
 void build_requesthdrs(rio_t *client_rio, char *newreq, 
                         char *hostname, char *port, char *path);
 void *thread(void *vargp);
+void cache_init(cache_t *c);                        /* 캐쉬 초기화 */
+cache_entry_t *cache_find(cache_t *c, char *uri);   /* 캐쉬 조회 */
+void cache_insert(cache_t *c, char *uri, 
+                  char *data, int size);             /* 캐쉬에 저장 */
+void cache_evict(cache_t *c);                        /* 캐쉬 : 가장 오래된 제거 */
+/* ---------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {   
@@ -53,6 +109,8 @@ int main(int argc, char **argv)
 
     /* SIGPIPE 무시 (클라이언트 끊어져도 Proxy 생존) */
     Signal(SIGPIPE, SIG_IGN);
+    /* 캐시 초기화 */
+    cache_init(&cache);
 
     /* 리스닝 소켓 생성 (Tiny와 동일) */
     listenfd = Open_listenfd(argv[1]);
@@ -85,18 +143,8 @@ int main(int argc, char **argv)
     return 0;
 }
 
-/*
- * thread - 각 클라이언트 요청을 처리하는 스레드 함수
- */
-void *thread(void *vargp)
-{
-    int connfd = *((int *)vargp);         /* 로컬 복사 */
-    Pthread_detach(Pthread_self());       /* 자동 정리 */
-    Free(vargp);                          /* 힙 해제 */
-    doit(connfd);                         /* 실제 처리 */
-    Close(connfd);                        /* 연결 종료 */
-    return NULL;
-}
+
+
 
 /*
  * doit - 한 HTTP 요청을 중계
@@ -322,6 +370,121 @@ void build_requesthdrs(rio_t *client_rio, char *newreq,
     /* 5. 빈 줄로 헤더 종료 */
     strcat(newreq, "\r\n");
 
+}
+
+/*
+ * thread - 각 클라이언트 요청을 처리하는 스레드 함수
+ */
+void *thread(void *vargp)
+{
+    int connfd = *((int *)vargp);         /* 로컬 복사 */
+    Pthread_detach(Pthread_self());       /* 자동 정리 */
+    Free(vargp);                          /* 힙 해제 */
+    doit(connfd);                         /* 실제 처리 */
+    Close(connfd);                        /* 연결 종료 */
+    return NULL;
+}
+
+/*
+ * 캐시 초기화
+ */
+
+void cache_init(cache_t *c)
+{
+    /* 빈 리스트로 초기화 */
+    /* head = NULL, tail = NULL */
+    /* total_size = 0 */
+
+    c->head = NULL;
+    c->tail = NULL;
+    c->total_size = 0;
+    
+    /* rwlock 초기화 */
+    pthread_rwlock_init(&c->lock, NULL);
+}
+
+/*
+ * 캐시 제거
+ */
+void cache_evict(cache_t *c)
+{
+    /* 1. 비어있으면 return */
+    if (c->tail == NULL) return;
+    
+    /* 2. 제거할 노드 = tail */
+    cache_entry_t *victim = c->tail;
+    
+    /* 3. total_size 감소 */
+    c->total_size -= victim->size;
+    
+    /* 4. tail 갱신 + 연결 끊기 */
+    //   case A: victim만 있는 경우 (head == tail == victim)
+    //       → c->head = NULL, c->tail = NULL
+    //   case B: 여러 개 있는 경우
+    //       → c->tail = victim->prev
+    //       → c->tail->next = NULL
+    if ( victim -> prev == NULL ) {
+        /* case A : 노드가 하나만 있는 경우 */
+        c-> head = NULL;
+        c-> tail = NULL;
+    } else {
+        /* case B : 여러 개 있었음 */
+        c->tail = victim->prev;
+        c->tail->next = NULL;
+    }
+
+    /* 5. 메모리 해제 */
+    Free(victim->data);
+    Free(victim);
+}
+
+/*
+ * 캐시 순회 + 일치하는 노드 찾는 로직
+ */
+cache_entry_t *cache_find(cache_t *c, char *uri)
+{
+    cache_entry_t *entry;
+    /* 1. head부터 순회하며 uri 일치 노드 찾기 */
+    for(entry = c->head; entry != NULL; entry = entry->next){
+        // String compare
+       if (strcmp(entry->uri, uri) == 0){
+            break;
+       }
+    }
+
+    /* 2. 못 찾으면 NULL 반환 */
+    if (entry == NULL){
+        return NULL;
+    }
+
+    /* 3. 찾으면:
+    *    a. 이미 head면 그대로 반환
+    */
+    if (entry == c->head){
+        return entry;
+    }
+
+    /* 3-b. 아니면 현재 위치에서 떼고 head로 이동 */
+    entry->prev->next = entry->next;
+
+    /* 3-c 뒷 노드 처리 */ 
+    if (entry == c->tail) {
+        /* entry가 tail일 경우 tail 갱신 */
+        c->tail = entry->prev;
+    } else {
+        /* 중간이면 다음 노드의 prev 연결 */
+        entry->next->prev = entry->prev;
+    }
+
+    /* 4. head로 이동 */
+    entry->prev = NULL;
+    entry->next = c->head;
+    c->head->prev = entry;
+    c->head = entry;
+
+    /* 5. 노드 포인터 반환 */
+    return entry;
+    
 }
 
 
