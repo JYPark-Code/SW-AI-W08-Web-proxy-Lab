@@ -29,6 +29,7 @@ void doit(int clientfd);
 int parse_uri(char *uri, char *hostname, char *port, char *path);
 void build_requesthdrs(rio_t *client_rio, char *newreq, 
                         char *hostname, char *port, char *path);
+void *thread(void *vargp);
 
 int main(int argc, char **argv)
 {   
@@ -36,7 +37,10 @@ int main(int argc, char **argv)
     // test_parse_uri();
     // exit(0);   
 
-    int listenfd, clientfd;
+    int listenfd;
+    // // 단일 쓰레드였을 때
+    // int clientfd;
+    pthread_t tid;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
@@ -47,26 +51,51 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    /* SIGPIPE 무시 (클라이언트 끊어져도 Proxy 생존) */
+    Signal(SIGPIPE, SIG_IGN);
+
     /* 리스닝 소켓 생성 (Tiny와 동일) */
     listenfd = Open_listenfd(argv[1]);
 
     /* 요청 받는 무한 루프 */
     while (1) {
         clientlen = sizeof(clientaddr);
-        clientfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        // 단일 쓰레드였을 때
+        // clientfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
         
+        /* 힙에 connfd 저장 (race condition 방지) */
+        int *connfdp = Malloc(sizeof(int));
+        *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+
         /* 접속한 클라이언트 정보 로그 */
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE,
                     port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
         
-        /* 요청 처리 (핵심!) */
-        doit(clientfd);
-        
-        /* 연결 종료 */
-        Close(clientfd);
+        // 단일 쓰레드였을 때
+        // /* 요청 처리 (핵심!) */
+        // doit(clientfd);
+        // /* 연결 종료 */
+        // Close(clientfd);
+
+
+        /* 새 스레드로 요청 처리 */
+        Pthread_create(&tid, NULL, thread, connfdp);
     }
     return 0;
+}
+
+/*
+ * thread - 각 클라이언트 요청을 처리하는 스레드 함수
+ */
+void *thread(void *vargp)
+{
+    int connfd = *((int *)vargp);         /* 로컬 복사 */
+    Pthread_detach(Pthread_self());       /* 자동 정리 */
+    Free(vargp);                          /* 힙 해제 */
+    doit(connfd);                         /* 실제 처리 */
+    Close(connfd);                        /* 연결 종료 */
+    return NULL;
 }
 
 /*
