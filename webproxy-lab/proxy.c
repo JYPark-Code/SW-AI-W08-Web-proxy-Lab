@@ -31,7 +31,11 @@ void build_requesthdrs(rio_t *client_rio, char *newreq,
                         char *hostname, char *port, char *path);
 
 int main(int argc, char **argv)
-{
+{   
+    /* uri 파싱 테스트 */
+    // test_parse_uri();
+    // exit(0);   
+
     int listenfd, clientfd;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
@@ -104,13 +108,13 @@ void doit(int clientfd)
     }
     printf("URI: %s\n", uri);
 
-    /* 3. URL 파싱 (parse_uri는 아직 빈 함수, 나중에 채움) */
+    /* 3. URL 파싱 */
     if (parse_uri(uri, hostname, port, path) < 0) {
         printf("parse_uri failed\n");
         return;
     }
 
-    /* 4. 새 요청 조립 (build_requesthdrs도 아직 빈 함수) */
+    /* 4. 새 요청 조립 */
     build_requesthdrs(&client_rio, newreq, hostname, port, path);
 
     /* 5. 백엔드 서버에 접속 */
@@ -128,6 +132,29 @@ void doit(int clientfd)
     /* 8. 백엔드 연결 종료 */
     Close(serverfd);
 }
+
+// uri 테스트 코드
+void test_parse_uri() {
+    char hostname[MAXLINE], port[MAXLINE], path[MAXLINE];
+    char *test_cases[] = {
+        "http://www.cmu.edu:8080/hub/index.html",
+        "http://www.cmu.edu/hub/index.html",
+        "http://localhost:15213/home.html",
+        "http://example.com/",
+        "http://example.com",
+        "ftp://invalid.com/"
+    };
+    
+    for (int i = 0; i < 6; i++) {
+        int ret = parse_uri(test_cases[i], hostname, port, path);
+        printf("URI: %s\n", test_cases[i]);
+        if (ret == 0)
+            printf("  host=%s, port=%s, path=%s\n", hostname, port, path);
+        else
+            printf("  FAIL (invalid URI)\n");
+    }
+}
+
 
 /*
  * parse_uri - "http://host:port/path" 형태의 URL을 분해
@@ -147,6 +174,54 @@ void doit(int clientfd)
 int parse_uri(char *uri, char *hostname, char *port, char *path)
 {
     /* TODO: 여기를 채워야 함 */
+    char *hostbegin, *hostend, *pathbegin, *portpos;
+    int len;
+
+    /* 1. http:// 확인 */
+    if (strncasecmp(uri, "http://", 7) != 0 ) {
+        return -1;
+    } 
+    hostbegin = uri + 7; /* http:// 건너뛰기 */
+
+    /* 2. path 시작점 (첫 '/' 찾기) */
+    pathbegin = strchr(hostbegin, '/');
+
+    if (pathbegin == NULL){
+        /* path 없음 예: "http://example.com" */
+        strcpy(path, "/");
+        hostend = hostbegin + strlen(hostbegin);
+    } else {
+        /* path 있음 */
+        strcpy(path, pathbegin); /* "/home.html" */
+        hostend = pathbegin;
+    }
+
+    /* 3. host:port 부분에서 ":" 찾기 */
+    portpos = NULL;
+    for (char *p = hostbegin; p < hostend; p++) {
+        if(*p == ':') {
+            portpos = p;
+            break;
+        }
+    }
+
+    if (portpos != NULL) {
+        /* ':' 있음 */
+        len = portpos - hostbegin;
+        strncpy(hostname, hostbegin, len);
+        hostname[len] = '\0';
+
+        len = hostend - portpos - 1;
+        strncpy(port, portpos + 1, len);
+        port[len] = '\0';
+    } else {
+        /* ':' 없음, 기본 포트 80 */
+        len = hostend - hostbegin;
+        strncpy(hostname, hostbegin, len);
+        hostname[len] = '\0';
+        strcpy(port, "80");
+    }
+
     return 0;
 }
 
@@ -170,5 +245,54 @@ void build_requesthdrs(rio_t *client_rio, char *newreq,
                         char *hostname, char *port, char *path)
 {
     /* TODO: */
-    newreq[0] = '\0';  // 빈 문자열로 초기화 (Rio_writen이 0바이트 쓰도록)
+    // newreq[0] = '\0';  // 빈 문자열로 초기화 (Rio_writen이 0바이트 쓰도록)
+
+    char buf[MAXLINE];
+    int has_host = 0;
+
+    /* 1. 요청 라인 (GET /path HTTP 1.0) */
+    sprintf(newreq, "GET %s HTTP/1.0\r\n", path);
+
+    /* 2. 브라우저가 보낸 헤더들 한 줄 씩 읽으면서 처리 */
+    while (Rio_readlineb(client_rio, buf, MAXLINE) > 0) {
+        /* 빈 줄이면 헤더 끝 */
+        if (strcmp(buf, "\r\n") == 0){
+            break;
+        }
+
+        /* host 헤더 : 브라우저 것 그대로 전달 (발견 표시) */
+        if (strncasecmp(buf, "Host:", 5) == 0) {
+            strcat(newreq, buf);
+            has_host =1;
+            continue;
+        }
+
+        /* 이 헤더들은 버림 (우리가 아래서 직접 추가) */
+        if (strncasecmp(buf, "User-Agent:", 11) == 0 ||
+            strncasecmp(buf, "Connection:", 11) == 0 ||
+            strncasecmp(buf, "Proxy-Connection:", 17) == 0) {
+            continue;
+        }
+
+
+        /* 나머지 헤더들은 그대로 전달 */
+        strcat(newreq, buf);
+    }
+
+    /* 3. Host 헤더가 없을 시, 채우기 */
+    if (!has_host) {
+        sprintf(buf, "Host: %s:%s\r\n", hostname, port);
+        strcat(newreq, buf);
+    }
+
+    /* 4. 필수 헤더 덮어쓰기 */
+    strcat(newreq, user_agent_hdr); /* 고정 User-Agent */
+    strcat(newreq, "Connection: close\r\n");
+    strcat(newreq, "Proxy-Connection: close\r\n");
+
+    /* 5. 빈 줄로 헤더 종료 */
+    strcat(newreq, "\r\n");
+
 }
+
+
