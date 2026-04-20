@@ -34,11 +34,12 @@
 
 /* 함수 프로토타입 선언 (구현은 아래에) */
 void doit(int fd);
-void read_requesthdrs(rio_t *rp);
+void read_requesthdrs(rio_t *rp, int *content_length);           /* 11.10 POST 메서드 */
 int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize);
+void serve_static(int fd, char *filename, int filesize, char *method);  /* 11.7 HEAD 메서드 */
 void get_filetype(char *filename, char *filetype);
-void serve_dynamic(int fd, char *filename, char *cgiargs);
+void serve_dynamic(int fd, char *filename, char *cgiargs,
+                   char *method, rio_t *rp, int content_length); /* 11.7 + 11.10 */
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
                  char *longmsg);
 
@@ -109,6 +110,7 @@ void doit(int fd)
   struct stat sbuf;
   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
   char filename[MAXLINE], cgiargs[MAXLINE];
+  int content_length = 0;
   rio_t rio;  /* RIO 버퍼 구조체 (내부 8KB 버퍼로 읽기 효율화) */
 
   /* RIO 버퍼 초기화: 이 fd에서 읽을 때 이 rio_t 사용하도록 연결 */
@@ -125,16 +127,28 @@ void doit(int fd)
 
   /* 메서드 검증: GET 외에는 501 Not Implemented 반환
    * strcasecmp: 대소문자 무시 비교 (GET == get == Get) */
-  if (strcasecmp(method, "GET"))
+  /* 11.7 + 11.10: GET / HEAD / POST 모두 허용 */
+  if (strcasecmp(method, "GET") &&
+      strcasecmp(method, "HEAD") &&
+      strcasecmp(method, "POST"))
   {
     clienterror(fd, method, "501", "Not Implemented",
                 "Tiny does not implement this method");
     return;
   }
 
+  /* 11.11: Path traversal 방어. parse_uri 전에 URI 원본에서 거른다. */
+  if (strstr(uri, ".."))
+  {
+    clienterror(fd, uri, "403", "Forbidden",
+                "Path traversal not allowed");
+    return;
+  }
+
   /* 요청 헤더 전부 읽고 버림 (Tiny는 헤더 내용 활용 안 함)
    * 단, 헤더를 다 소비해야 다음 요청과 섞이지 않음 */
-  read_requesthdrs(&rio);
+  /* 11.10: 헤더에서 Content-Length 파싱해서 받아옴 */
+  read_requesthdrs(&rio, &content_length);
 
   /* URI 파싱: URI → 파일 경로(filename) + CGI 인자(cgiargs) 분리
    * 반환값: 1이면 정적, 0이면 동적 */
@@ -162,7 +176,8 @@ void doit(int fd)
                   "Tiny couldn't read the file");
       return;
     }
-    serve_static(fd, filename, sbuf.st_size);
+    /* 11.7: method 전달 */
+    serve_static(fd, filename, sbuf.st_size, method);
   }
   else
   { /* 동적 컨텐츠 (CGI) 처리 */
@@ -174,7 +189,8 @@ void doit(int fd)
                   "Tiny couldn't run the CGI program");
       return;
     }
-    serve_dynamic(fd, filename, cgiargs);
+    /* 11.7 + 11.10: method, rp, content_length 전달 */
+    serve_dynamic(fd, filename, cgiargs, method, &rio, content_length);
   }
 }
 
@@ -193,7 +209,7 @@ void doit(int fd)
  *
  * 종료 조건: 읽은 줄이 "\r\n"(빈 줄)일 때.
  */
-void read_requesthdrs(rio_t *rp)
+void read_requesthdrs(rio_t *rp, int *content_length)
 {
   char buf[MAXLINE];
 
@@ -207,6 +223,10 @@ void read_requesthdrs(rio_t *rp)
   {
     Rio_readlineb(rp, buf, MAXLINE);
     printf("%s", buf);
+
+     /* 11.10: Content-Length 헤더 파싱 (대소문자 무시) */
+    if (!strncasecmp(buf, "Content-Length:", 15))
+      *content_length = atoi(buf + 15);
   }
   return;
 }
@@ -284,7 +304,7 @@ int parse_uri(char *uri, char *filename, char *cgiargs)
  *   파일을 메모리 주소 공간에 매핑 → read/copy 없이 포인터로 바로 전송.
  *   대용량 파일에 유리 (커널이 페이지 단위로 효율 관리).
  */
-void serve_static(int fd, char *filename, int filesize)
+void serve_static(int fd, char *filename, int filesize, char *method)
 {
   int srcfd;
   char *srcp, filetype[MAXLINE];
@@ -325,24 +345,30 @@ void serve_static(int fd, char *filename, int filesize)
   printf("Response headers:\n");
   printf("%s", buf);
 
-  /* 응답 바디 전송 */
-  srcfd = Open(filename, O_RDONLY, 0);  /* 파일 열기 */
+  /* 11.7: HEAD는 여기서 종료 (헤더만 보내고 바디 생략) */
+  if (!strcasecmp(method, "HEAD"))
+    return;
 
-  /* mmap: 파일 내용을 메모리에 매핑
-   * PROT_READ: 읽기 전용
-   * MAP_PRIVATE: 복사 (원본 보호), 메모리 수정이 파일에 반영 안 됨 */
-  srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
-
-  /* 매핑 이후에는 srcfd 필요 없음 (매핑이 자체 참조 유지) */
+  /* 11.9: mmap/Munmap → Malloc + Rio_readn + free */
+  srcfd = Open(filename, O_RDONLY, 0);
+  srcp = (char *)Malloc(filesize);
+  Rio_readn(srcfd, srcp, filesize);
   Close(srcfd);
-
-  /* 매핑된 메모리 내용을 소켓으로 전송 */
   Rio_writen(fd, srcp, filesize);
+  free(srcp);
 
-  /* 매핑 해제 (메모리 회수) */
-  Munmap(srcp, filesize);
-
-  /* [숙제 11.9] 이 함수를 mmap 대신 malloc + rio_readn으로 바꿔보기 */
+  /* 응답 바디 전송 (이전 mmap 방식) */
+  // srcfd = Open(filename, O_RDONLY, 0);  /* 파일 열기 */
+  // /* mmap: 파일 내용을 메모리에 매핑
+  //  * PROT_READ: 읽기 전용
+  //  * MAP_PRIVATE: 복사 (원본 보호), 메모리 수정이 파일에 반영 안 됨 */
+  // srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
+  // /* 매핑 이후에는 srcfd 필요 없음 (매핑이 자체 참조 유지) */
+  // Close(srcfd);
+  // /* 매핑된 메모리 내용을 소켓으로 전송 */
+  // Rio_writen(fd, srcp, filesize);
+  // /* 매핑 해제 (메모리 회수) */
+  // Munmap(srcp, filesize);
 }
 
 /*
@@ -401,15 +427,31 @@ void get_filetype(char *filename, char *filetype)
  * 주의: CGI 프로그램이 QUERY_STRING을 "key=value&key=value" 형식으로
  *       기대할 수 있음. 예: adder는 "n1=15213&n2=18213" 필요.
  */
-void serve_dynamic(int fd, char *filename, char *cgiargs)
+void serve_dynamic(int fd, char *filename, char *cgiargs,
+                   char *method, rio_t *rp, int content_length)
 {
   char buf[MAXLINE], *emptylist[] = {NULL};  /* CGI에 넘길 argv (없음) */
+  char *body = NULL;
+  int pipefd[2] = {-1, -1};
+  int is_post = !strcasecmp(method, "POST");
 
   /* HTTP 응답의 처음 두 헤더는 부모(Tiny)가 보냄 */
   sprintf(buf, "HTTP/1.0 200 OK\r\n");
   Rio_writen(fd, buf, strlen(buf));
   sprintf(buf, "Server: Tiny Web Server\r\n");
   Rio_writen(fd, buf, strlen(buf));
+
+  /* 11.10: POST면 바디를 읽어 pipe에 써둠 (CGI가 stdin으로 읽도록) */
+  if (is_post && content_length > 0)
+  {
+    body = (char *)Malloc(content_length);
+    Rio_readnb(rp, body, content_length);
+
+    if (pipe(pipefd) < 0) { free(body); return; }
+    Rio_writen(pipefd[1], body, content_length);
+    Close(pipefd[1]);          /* write end 닫아 EOF 전달 */
+    free(body);
+  }
 
   /* fork: 자식 프로세스 생성
    * Fork() 반환값:
@@ -422,16 +464,39 @@ void serve_dynamic(int fd, char *filename, char *cgiargs)
     /* 환경변수 설정: CGI 프로그램이 getenv("QUERY_STRING")으로 읽음
      * 세 번째 인자 1 = 기존 값 덮어쓰기 */
     setenv("QUERY_STRING", cgiargs, 1); // line:netp:servedynamic:setenv
+    setenv("REQUEST_METHOD", method, 1);     /* 11.10: CGI가 method 판별 */
 
     /* ★ 핵심: stdout(fd 1)을 소켓(fd)으로 리다이렉트
-     * 이후 자식의 printf 출력은 네트워크로 감 */
-    Dup2(fd, STDOUT_FILENO); // line:netp:servedynamic:dup2
+    * 이후 자식의 printf 출력은 네트워크로 감 */
+    if (is_post && content_length > 0)
+    {
+      char clen[32];
+      sprintf(clen, "%d", content_length);
+      setenv("CONTENT_LENGTH", clen, 1);
+      Dup2(pipefd[0], STDIN_FILENO); // line:netp:servedynamic:dup2
+      Close(pipefd[0]);
+    }
 
     /* 프로세스 이미지를 CGI 프로그램으로 교체
      * 성공하면 이 함수는 돌아오지 않음 (자식은 이제 CGI 프로그램)
      * 환경변수와 fd 테이블은 execve 이후에도 유지됨 */
+    Dup2(fd, STDOUT_FILENO);
     Execve(filename, emptylist, environ); // line:netp:servedynamic:execve
   }
+
+  /*
+    부모: pipe() → pipefd[0], pipefd[1] 둘 다 열림
+    부모: pipefd[1]에 바디 쓰기
+    부모: Close(pipefd[1])     ← 이건 닫음
+    부모: Fork() → 자식 생성
+    자식: Dup2(pipefd[0], STDIN_FILENO); Close(pipefd[0]) 
+    -----------------------------------------------------
+    까지 완료 -> fd 누수 방지 필요.
+  */
+
+  /* 부모: 사용하지 않는 pipe read end 닫기 (fd 누수 방지) */
+  if (pipefd[0] != -1)
+    Close(pipefd[0]);
 
   /* 부모 프로세스: 자식 종료 대기 (좀비 방지)
    * Wait(NULL)은 아무 자식이나 종료 시까지 블록, 종료 상태 무시 */
