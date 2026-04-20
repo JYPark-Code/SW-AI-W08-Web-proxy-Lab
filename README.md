@@ -195,27 +195,158 @@ printf 'GET /../../etc/passwd HTTP/1.0\r\n\r\n' | nc localhost 8000
 
 ---
 
-### Part 4: Proxy — Sequential (순차 처리)
+### Part 4: Proxy — Sequential (순차 처리)### Part 4: Proxy — Sequential (순차 처리)
 
 - [x] Proxylab PDF 정독
-- [ ] `proxy.c` 구조 설계 (어떤 함수로 나눌지)
-- [ ] 리스닝 소켓 열기 (`Open_listenfd`)
-- [ ] accept 루프 구현
-- [ ] 클라이언트 요청 라인 파싱
-- [ ] URI에서 host/port/path 분리
-- [ ] 요청 헤더 읽기 및 재작성
-  - [ ] Host 헤더 처리
-  - [ ] User-Agent 고정 문자열로 치환
-  - [ ] Connection: close 설정
-  - [ ] Proxy-Connection: close 설정
-  - [ ] 나머지 헤더는 그대로 전달
-- [ ] HTTP/1.1 → HTTP/1.0 변환
-- [ ] 타겟 서버 접속 (`Open_clientfd`)
-- [ ] 요청 전달
-- [ ] 응답 수신 및 클라이언트로 전달 (바이너리 데이터 주의)
-- [ ] curl로 테스트 (`curl -v --proxy http://localhost:PORT http://...`)
-- [ ] 브라우저 프록시 설정으로 실사이트 테스트
-- [ ] `./driver.sh` Basic 테스트 통과
+- [x] `proxy.c` 구조 설계 (doit / parse_uri / build_requesthdrs 분리)
+- [x] 리스닝 소켓 열기 (`Open_listenfd`)
+- [x] accept 루프 구현
+- [x] 클라이언트 요청 라인 파싱
+- [x] URI에서 host/port/path 분리
+- [x] 요청 헤더 읽기 및 재작성
+  - [x] Host 헤더 처리 (브라우저 것 유지, 없으면 추가)
+  - [x] User-Agent 고정 문자열로 치환
+  - [x] Connection: close 설정
+  - [x] Proxy-Connection: close 설정
+  - [x] 나머지 헤더는 그대로 전달
+- [x] HTTP/1.1 → HTTP/1.0 변환
+- [x] 타겟 서버 접속 (`Open_clientfd`)
+- [x] 요청 전달
+- [x] 응답 수신 및 클라이언트로 전달 (바이너리 데이터 주의)
+- [x] curl로 테스트 (`curl -v --proxy http://localhost:PORT http://...`)
+- [x] `./driver.sh` Basic 40/40 통과
+
+#### Part 4 — 구현 플로우 & 배운 점
+
+**Tiny → Proxy: 역할의 전환 — 콘텐츠 생산자에서 중계자로**
+
+Tiny를 만든 경험이 Proxy 설계의 기반이 됐는데, **구조는 비슷해 보여도 역할이 완전히 다르다**는 걸 일찍 깨달은 게 컸다. 겉으로는 둘 다 accept 루프 + doit 구조지만, doit 내부에서 하는 일이 근본적으로 다르다.
+
+| 측면 | Tiny | Proxy |
+|---|---|---|
+| 역할 | 콘텐츠 생산자 | 중계자 |
+| 응답 출처 | 서버 디스크의 파일 | 다른 서버의 응답 |
+| 주요 활동 | 요청 파싱 → 파일 읽기 → 응답 조립 | 요청 파싱 → 백엔드 전달 → 응답 중계 |
+| 소켓 역할 | 서버 전용 | 서버 + 클라이언트 |
+| 관리할 fd | 1개 (connfd) | 2개 (clientfd + serverfd) |
+| RIO 버퍼 | 1개 | 2개 (각 fd마다) |
+| URI 의미 | 파일 경로 (`/home.html`) | 전체 URL (`http://host:port/path`) |
+
+팀원 한 명이 "csapp.h에서 그냥 import해서 쓰면 되지 않냐"고 조언했는데, 확인해보니 csapp은 `Open_listenfd`, `Open_clientfd`, RIO 패키지 같은 **공통 도구**만 제공할 뿐 `parse_uri`, `doit` 같은 애플리케이션 로직은 없다. 본인이 직접 설계해야 하는 부분이 명확해지니 오히려 학습 목표가 뚜렷해졌다. "가져와 쓰는 것"과 "본질을 이해하는 것"은 다르다.
+
+---
+
+**parse_uri — Tiny와 이름만 같고 알고리즘은 완전히 다름**
+
+Tiny의 `parse_uri`는 `/cgi-bin/adder?n1=15213`을 받아 정적/동적 판별 + 쿼리 분리를 했다. Proxy의 `parse_uri`는 `http://host:port/path` 형태의 전체 URL을 받아 세 조각으로 분해해야 한다. 이름만 같지 입력·출력·알고리즘 전부 다르다.
+
+알고리즘 설계에서 두 가지 결정이 있었다:
+
+**1. `/` 먼저 찾고 그 다음 `:` 찾기**
+
+`:`을 먼저 찾으면 포트 생략된 URL(`http://example.com/page`)에서 NULL 케이스를 분리해 다시 생각해야 했다. `/`를 먼저 기준선으로 그어 path를 분리하면, 남은 영역(host:port)만 `:`으로 쪼개면 된다. 영역을 먼저 제한한 뒤 내부를 쪼개는 순서가 깔끔했다.
+
+**2. `strchr` 대신 범위 제한 for 루프**
+
+`:` 찾을 때 `strchr`을 쓰면 문자열 끝까지 뒤지기 때문에, path 안에 `:`이 있으면 오인식할 수 있다. 원본 `uri`를 수정해 임시 `\0`을 넣는 방법도 있지만, **원본을 건드리지 않는 게 안전**하다고 판단해 for 루프로 `hostbegin`부터 `hostend`까지 범위 제한 순회했다.
+
+엣지 케이스 3개 — `http://` 아닌 URI, path 생략(`/` 기본값), port 생략(`80` 기본값) — 를 따로따로 처리. 6개 테스트 케이스 모두 통과 후 doit 통합.
+
+`strncpy` 사용에서 C의 "편의와 안전의 트레이드오프"를 다시 체감했다. `strcpy`는 `\0` 만날 때까지 복사해버리니 원본 uri가 통째로 들어오는데, 일부만 잘라 써야 하니 `strncpy + 수동 '\0'` 패턴이 필요하다. `strncpy`는 소스가 n보다 길면 **null 종결을 안 해주는** 함정이 있어서 `hostname[len] = '\0'`을 빼먹으면 안 된다. 현대 C 코드는 `snprintf`를 선호하지만, 이 함수는 포인터 연산과 길이 계산을 함께 연습하는 게 목적이라 의도적으로 `strncpy`를 썼다.
+
+---
+
+**build_requesthdrs — "루프 안"과 "루프 밖"의 구분**
+
+이 함수에서 가장 크게 배운 건 **알고리즘의 루프 내/외 분리**다. 첫 구현에서 모든 로직을 while 루프 안에 넣었다가, User-Agent와 Connection 헤더가 헤더 수만큼 반복 추가되는 버그를 만들었다. 브라우저가 보낸 헤더가 4줄이면 최종 newreq에 `User-Agent: Mozilla...`, `Connection: close`, `Proxy-Connection: close`, 빈 줄이 각각 4번씩 들어가는 식이다.
+
+올바른 구조:
+- **루프 안**: 각 헤더에 대한 분류 작업 (그대로 전달? 버림? 보관?)
+- **루프 밖**: 전체 헤더를 다 본 후 한 번만 할 마무리 (고정 헤더 추가, 빈 줄 종료)
+
+이걸 고치고 나서도 또 하나 놓쳤다. `Host:`만 따로 처리하고 "나머지는 그대로 전달"했는데, 그 "나머지"에 User-Agent, Connection, Proxy-Connection이 다 포함돼 있었다. **브라우저 버전과 우리 버전이 둘 다 newreq에 들어가** 중복. 세 헤더를 `continue`로 버리는 분기를 추가하고서야 해결.
+
+재구성된 최종 구조:
+```
+for each header line:
+if 빈 줄: break (헤더 끝)
+if Host:  → newreq에 추가, has_host 표시, continue
+if User-Agent/Connection/Proxy-Connection: → 버림, continue
+else: newreq에 그대로 추가 (Accept, Cookie 등)
+루프 끝 후:
+if not has_host: Host 헤더 추가
+user_agent_hdr 추가 (고정)
+Connection: close 추가
+Proxy-Connection: close 추가
+\r\n (빈 줄)
+```
+배운 점: **헤더 분류를 "수용(accept) + 거부(reject) + 기본값(default)"의 3단 게이트**로 생각해야 한다는 것. "Host는 특수처리, 나머지는 통과"식의 2단 분류는 숨은 케이스를 놓치기 쉽다.
+
+---
+
+**응답 전달 — Rio_readnb를 반드시 써야 하는 이유**
+
+driver.sh의 basic 테스트 대상은 `home.html`, `csapp.c`, `tiny.c`, `godzilla.jpg`, `tiny` 다섯 개. 앞 셋은 텍스트지만 `godzilla.jpg`는 이미지이고 `tiny`는 **실행 바이너리**다. 이걸 그대로 중계하려면 응답 바디에 `Rio_readlineb`를 쓰면 안 된다. 바이너리 데이터 중에 우연히 `0x0A`가 있으면 readlineb가 "줄 끝"으로 오인해 버퍼링이 어긋나고, diff에서 실패한다.
+
+```c
+while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
+    Rio_writen(clientfd, buf, n);
+}
+```
+
+요청 라인과 헤더는 텍스트니까 readlineb, 응답 바디는 바이너리 가능성 때문에 readnb. 이 구분이 Proxy 구현의 핵심 디테일이다.
+
+바이트 경계가 안 지켜지는 TCP의 특성상, "한 번의 readnb가 전체 응답을 가져온다"고 가정할 수 없다. while 루프로 `readnb`가 0을 반환(EOF = 백엔드가 연결 종료)할 때까지 반복해야 완전한 중계가 된다. 백엔드에 `Connection: close`를 강제로 설정한 게 여기서 의미를 가진다 — Content-Length 헤더 파싱 없이 "연결 끊기"를 응답 끝으로 삼을 수 있다.
+
+---
+
+**fd/rio_t 2개 관리 — 서버이자 클라이언트의 구조**
+
+doit 함수 내부에 관리해야 할 자원이 Tiny보다 2배가 됐다:
+- `clientfd` + `client_rio`: 브라우저 쪽 연결
+- `serverfd` + `server_rio`: 백엔드 쪽 연결
+
+각 연결마다 **독립된 rio_t가 필요**하다. 한 `rio_t`는 하나의 fd에 귀속된 8KB 내부 버퍼를 들고 있어서, 같은 rio_t를 다른 fd로 재초기화하면 이전 fd의 남은 바이트가 섞여 버그가 된다.
+
+자원 관리 책임도 분리:
+- `clientfd`: main이 accept하고 main이 close (Tiny와 동일)
+- `serverfd`: doit이 Open_clientfd로 열고 doit 끝에서 close
+
+close를 빼먹으면 fd 누수로 "Too many open files" 에러가 나는데, Part 2 concurrency에서 스레드 수천 개 돌리면 바로 드러나는 버그다. Part 1에서부터 `Close(serverfd)`를 빼먹지 않도록 의식하며 구현.
+
+---
+
+**테스트 전략 — parse_uri 단독 테스트**
+
+doit 전체를 다 짜놓고 테스트하면 어디서 터졌는지 찾기 어렵다. parse_uri를 먼저 작성한 뒤 main 상단에 임시 테스트 함수를 넣어 단독 검증했다:
+
+```c
+void test_parse_uri() {
+    char hostname[MAXLINE], port[MAXLINE], path[MAXLINE];
+    char *cases[] = {
+        "http://www.cmu.edu:8080/hub/index.html",
+        "http://www.cmu.edu/hub/index.html",
+        "http://localhost:15213/home.html",
+        "http://example.com/",
+        "http://example.com",
+        "ftp://invalid.com/"
+    };
+    // 각 케이스 parse_uri 호출 후 결과 출력
+}
+```
+
+테스트 통과 확인 후 `exit(0)`으로 main을 막아두고 parse_uri만 검증. 6개 케이스 다 맞으면 삭제하고 실제 doit 통합으로 넘어갔다. **파싱 함수는 단위 테스트가 가장 효과적**이라는 걸 재확인. Tiny 때는 전체 통합 테스트(curl로 home.html 받기)밖에 안 했는데, 이번처럼 파싱 로직이 분기 많은 함수는 단위 테스트가 디버깅 시간을 크게 줄인다.
+
+**driver.sh 통과 기준 해석**
+
+basic 테스트 로직을 읽어본 게 구현 방향에 도움이 됐다:
+
+1. Tiny 직접 호출로 파일 다운로드 → .noproxy/ 에 저장
+2. Proxy 경유로 같은 파일 다운로드 → .proxy/ 에 저장
+3. diff -q로 두 파일 비교
+
+**프록시가 응답을 변조 없이 그대로 전달하면 통과**. 이 심플한 기준이 있으니 구현 목표가 명확해졌다 — HTTP/1.1 → HTTP/1.0 다운그레이드를 하면서도 **바디는 한 바이트도 손상 없이** 전달해야 한다. 헤더를 아무리 자유롭게 재작성해도 바디는 통과여야 한다는 것. 텍스트/이미지/실행 바이너리 5개 모두 identical 판정 받아 40/40 획득.
+
 
 ### Part 5: Proxy — Concurrency (동시성)
 
