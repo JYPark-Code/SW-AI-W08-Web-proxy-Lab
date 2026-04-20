@@ -3,7 +3,8 @@
         {
             "name": "Linux",
             "includePath": [
-                "${default}"
+                "${default}",
+                "${workspaceFolder}/webproxy-lab"
             ],
             "defines": [
                 "_GNU_SOURCE"
