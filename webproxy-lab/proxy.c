@@ -191,6 +191,17 @@ void doit(int clientfd)
         return;
     }
 
+    /* Cache 처리 : 캐시 조회 (HIT면 바로 응답) */
+    /* 3. 캐시 조회 (HIT면 바로 응답) */
+    pthread_rwlock_rdlock(&cache.lock);
+    cache_entry_t *cached = cache_find(&cache, uri);
+    if (cached != NULL) {
+        Rio_writen(clientfd, cached->data, cached->size);
+        pthread_rwlock_unlock(&cache.lock);
+        return;
+    }
+    pthread_rwlock_unlock(&cache.lock);
+
     /* 4. 새 요청 조립 */
     build_requesthdrs(&client_rio, newreq, hostname, port, path);
 
@@ -201,9 +212,32 @@ void doit(int clientfd)
     /* 6. 새 요청 전송 */
     Rio_writen(serverfd, newreq, strlen(newreq));
 
+    /* Cache 처리 : 응답 -> 클라이언트 전달 + 캐시 버퍼 누적 */
+    char cache_buf[MAX_OBJECT_SIZE];
+    int cache_size = 0;
+    int too_big = 0;
+
     /* 7. 응답 받아서 브라우저로 그대로 전달 */
     while ((n = Rio_readnb(&server_rio, buf, MAXLINE)) > 0) {
         Rio_writen(clientfd, buf, n);
+
+        /* 캐시 버퍼에 누적 (오버플로 체크) */
+        if (!too_big) {
+            if (cache_size + n <= MAX_OBJECT_SIZE) {
+                memcpy(cache_buf + cache_size, buf, n);
+                cache_size += n;
+            } else {
+                too_big = 1;  /* 너무 커서 캐시 포기 */
+            }
+        }
+
+    }
+
+    /* Cache 처리 : 캐시에 저장 (작으면) */
+    if (!too_big && cache_size > 0) {
+        pthread_rwlock_wrlock(&cache.lock);
+        cache_insert(&cache, uri, cache_buf, cache_size);
+        pthread_rwlock_unlock(&cache.lock);
     }
 
     /* 8. 백엔드 연결 종료 */
@@ -444,47 +478,53 @@ void cache_evict(cache_t *c)
 cache_entry_t *cache_find(cache_t *c, char *uri)
 {
     cache_entry_t *entry;
-    /* 1. head부터 순회하며 uri 일치 노드 찾기 */
-    for(entry = c->head; entry != NULL; entry = entry->next){
-        // String compare
-       if (strcmp(entry->uri, uri) == 0){
-            break;
-       }
+    
+    /* 순회하며 uri 일치하는 노드 찾기 */
+    for (entry = c->head; entry != NULL; entry = entry->next) {
+        if (strcmp(entry->uri, uri) == 0) {
+            return entry;   /* 찾으면 그냥 반환 (LRU 이동 없음) */
+        }
+    }
+    
+    return NULL;   /* 못 찾음 */
+}
+
+/*
+ * 캐시 생성  
+ */
+void cache_insert(cache_t *c, char *uri, char *data, int size)
+{   
+    /* 1. size > MAX_OBJECT_SIZE 캐시 안 함 */
+    if (size > MAX_OBJECT_SIZE){
+        return;
     }
 
-    /* 2. 못 찾으면 NULL 반환 */
-    if (entry == NULL){
-        return NULL;
+    /* 2. 공간 확보 : total_size _ size > MAX_CACHE_SIZE면 evict 반복 */
+    while (c->total_size + size > MAX_CACHE_SIZE) {
+        cache_evict(c);
     }
 
-    /* 3. 찾으면:
-    *    a. 이미 head면 그대로 반환
-    */
-    if (entry == c->head){
-        return entry;
-    }
+    /* 3. 새 엔트리 생성 */
+    cache_entry_t *entry = Malloc(sizeof(cache_entry_t));
+    strcpy(entry->uri, uri);
+    entry->data = Malloc(size);
+    memcpy(entry->data, data, size);
+    entry->size = size;
 
-    /* 3-b. 아니면 현재 위치에서 떼고 head로 이동 */
-    entry->prev->next = entry->next;
-
-    /* 3-c 뒷 노드 처리 */ 
-    if (entry == c->tail) {
-        /* entry가 tail일 경우 tail 갱신 */
-        c->tail = entry->prev;
-    } else {
-        /* 중간이면 다음 노드의 prev 연결 */
-        entry->next->prev = entry->prev;
-    }
-
-    /* 4. head로 이동 */
+    /* 4. head에 삽입 (이중 연결 리스트) */
     entry->prev = NULL;
     entry->next = c->head;
-    c->head->prev = entry;
+    if (c->head != NULL){
+        c->head->prev = entry;
+    } else {
+        /* 빈 리스트 일 경우 -> tail도 지정 */
+        c -> tail = entry;
+    }
     c->head = entry;
 
-    /* 5. 노드 포인터 반환 */
-    return entry;
-    
+    /* 5. total size 갱신 */
+    c->total_size += size;
+
 }
 
 
